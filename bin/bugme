@@ -1,0 +1,477 @@
+#!/bin/bash
+
+gm_keyword=global-media-requirement
+gm_product="media operations"
+gm_component="Global Media"
+gm_topic="Global Media"
+gm_component_arch="Global Media Architecture"
+gm_topic_arch="Global Media Architecture"
+gm_email="global-media-se@yahoo-inc.com"
+
+default_products=( "media operations" "Lego Build Release" "Lego" "YGlobal" )
+
+args=( )
+requested_priority=""
+requested_severity=""
+subject=""
+prefix=""
+product="${gm_product}"
+component="${gm_component}"
+assigned_to=""
+url=""
+bugtype="Defect"
+dependson=""
+blocked=""
+priority=""
+#alias=""
+bug_severity=""
+#bug_status=""
+cc=""
+#deadline=""
+#duplicate_of=""
+#environment=""
+#estimated_time=""
+keywords=""
+#op_sys=""
+production=""
+#qa_contact=""
+#rep_platform=""
+#reporter=""
+#resolution=""
+#target_milestone=""
+#target_version=""
+#version=""
+#work_time=""
+#status_whiteboard=""
+comment=""
+find_master=""
+debug=""
+
+rc=0
+
+add_subject() {
+  local topic="$1"
+  local unshopt="$(shopt -p nocaseglob)"
+  shopt -s nocaseglob
+  topic="$(echo "${topic}" | perl -pe 's/(^|\s)([a-z])/$1\U$2/g')"
+  if [[ "${subject}" != *"[${topic}]"* ]]; then
+    subject="${subject}[${topic}]"
+  fi
+  ${unshopt}
+}
+
+set_priority() {
+  local p="$1"
+  if [[ "${p}" == [1-5] ]]; then
+    priority="P${p}"
+  elif [[ "${p}" == [pP][1-5] ]]; then
+    priority="P${p#?}"
+  else
+    echo "priority must be 'P1' through 'P5'"
+    exit 1
+  fi
+}
+
+set_severity() {
+  local s="$1"
+  if [[ "${s}" == [1-5] ]]; then
+    bug_severity="${s}"
+  elif [[ "${s}" == [sS][1-5] ]]; then
+    bug_severity="${s#?}"
+  else
+    echo "severity must be '1' through '5'"
+    exit 1
+  fi
+}
+
+add_keyword() {
+  local kw="$1"; shift
+  if [[ -n "${keywords}" ]]; then
+    if [[ " ${keywords} " == *" ${kw} "* ]]; then
+      echo "keyword ${kw} already added" 1>&2
+    else
+      keywords="${keywords} ${kw}"
+    fi
+  else
+    keywords="${kw}"
+  fi
+}
+
+add_gm_keyword() {
+  add_keyword "global-media-requirement"
+}
+
+add_cc() {
+  local address
+  for address in "$@"; do
+    [[ "${address}" != *@* ]] && address="${address}@yahoo-inc.com"
+    cc="${cc:+${cc},}${address}"
+  done
+}
+
+find_component() {
+  local c="$1"; shift
+  local products=( "$@" )
+  local p m
+  if [[ -z "${products[*]}" ]]; then
+    products=( "${default_products[@]}" )
+  fi
+  for p in "${products[@]}"; do
+    m="$(show_components "${p}" | grep -x -i "${c}" | head -1)"
+    if [[ -n "${m}" ]]; then
+      product="${p}"
+      component="${m}"
+      break
+    fi
+  done
+  if [[ -z "${m}" ]]; then
+    echo "Could not find a component matching '${c}' in products ${products[@]}" 1>&2
+    exit 1
+  fi
+}
+
+prodcomp() {
+  local prodcomp="$1"; shift
+  case "${prodcomp}" in
+    -p ) product="$1"; shift ;;
+    -c ) component="$1"; shift ;;
+    gm:* ) product="media operations"; component="Global Media ${prodcomp#gm:}" ;;
+    lego:* ) product="Lego"; component="${prodcomp#lego:}" ;;
+    *: ) product="${prodcomp%:}" ;;
+    :* ) component="${prodcomp#:}" ;;
+    *:* ) product="${prodcomp%:*}"; component="${prodcomp#*:}" ;;
+    * ) find_component "${prodcomp}" ;;
+  esac
+  add_cc "${gm_email}"
+  add_gm_keyword
+}
+
+file_age() {
+  local f="$1"
+  local s1 s2
+  if [[ -f "$f" ]]; then
+    s1=$(date +%s)
+    s2=$(stat -c %Y "${f}")
+    echo $(( s1 - s2 ))
+  fi
+  return 0
+}
+
+show_components() {
+  local product="$1"; shift
+  local xmlcache="${HOME}/.ybug/cache/product.${product}.xml"
+  local componentcache="${HOME}/.ybug/cache/components.${product}.txt"
+  if [[ ! -f "${xmlcache}" || $(file_age "${xmlcache}") -gt 300 ]]; then
+    ybug -x show_product "${product}" > "${xmlcache}"
+  fi
+  if [[ ! -f "${componentcache}" || "${xmlcache}" -nt "${componentcache}" || $(file_age "${componentcache}") -gt 300 ]]; then
+    grep -v DOCTYPE "${xmlcache}" | xpath -p '//components/name' 2>/dev/null | perl -pe 's/<name>//g; s/<\/name>/\n/g;' > "${componentcache}"
+  fi
+  cat "${componentcache}"
+  return 0
+}
+
+if [[ $# -eq 0 ]]; then
+  show_components "${gm_product}" | awk '/^Global Media / { print "-" tolower($3) } /^Global Media$/ { print "-gm" }'
+  exit 0
+fi
+
+while [[ -n "$1" ]]; do
+  arg="$1"; shift
+  if [[ "${arg}" == -??* && "${arg}" != --* ]]; then
+    arg="-${arg}"
+  fi
+  case "${arg}" in
+           --prod \
+   | --production )
+                    production="yes"
+                    ;;
+       --priority \
+             | -p )
+                    requested_priority="$1"; shift
+                    ;;
+           [pP][1-5] )
+                    requested_priority="${arg#?}"
+                    ;;
+           [sS][1-5] )
+                    requested_severity="${arg#?}"
+                    ;;
+         --[pP][1-5] )
+                    requested_priority="${arg#-?}"
+                    ;;
+         --[sS][1-5] )
+                    requested_severity="${arg#-?}"
+                    ;;
+       --severity \
+             | -s )
+                    requested_severity="$1"; shift
+                    ;;
+        --blocked \
+       | --blocks )
+                    blocked="${blocked:+${blocked},}$1"; shift
+                    ;;
+             --cc )
+                    add_cc "$1"; shift
+                    ;;
+           --ccgm )
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+           -[0-9] )
+                    requested_priority="${arg#-}"
+                    ;;
+             --gm ) 
+                    prefix="[${gm_topic}]"
+                    product="${gm_product}"
+                    component="${gm_component}" 
+                    bugtype="Task"
+                    ;;
+           --arch \
+       | --gmarch )
+                    prefix="[${gm_topic_arch}]"
+                    product="${gm_product}"
+                    component="${gm_component_arch}" 
+                    bugtype="Rollup"
+                    assigned_to="${USER}@yahoo-inc.com"
+                    ;;
+        --keyword \
+          | --key \
+           | --kw \
+             | -k ) 
+                    add_keyword "$1"
+                    shift
+                    ;;
+            --gmr ) 
+                    add_gm_keyword
+                    ;;
+        --release \
+  | --legorelease )
+                    prefix="[SE]"
+                    product="Lego Build Release"
+                    component="General"
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+          --build )
+                    prefix="[SE]"
+                    product="Lego Build Release"
+                    component="Build and Assembly"
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+     --deployment \
+       | --deploy )
+                    prefix="[SE]"
+                    product="Lego Build Release"
+                    component="Deployment"
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+            --api \
+      | --legoapi )
+                    prefix="[SE]"
+                    product="Lego"
+                    component="API"
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+           --tool \
+        | --tools )
+                    prefix="[SE]"
+                    product="Lego"
+                    component="Tools"
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+           --base \
+    | --baseplate \
+     | --legobase )
+                    prefix="[SE]"
+                    product="Lego"
+                    component="Baseplate"
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+           --lego )
+                    prefix="[SE]"
+                    product="Lego"
+                    component="General"
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+            --yub )
+                    prefix="[${gm_component}][YUB]"
+                    product="YGlobal"
+                    component="yub"
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+            --ycb )
+                    prefix="[${gm_component}][YCB]"
+                    product="YGlobal"
+                    component="ycb"
+                    add_cc "${gm_email}"
+                    add_gm_keyword
+                    ;;
+            --url \
+             | -u ) 
+                    bug_file_loc="$1"
+                    shift 
+                    ;;
+             --to \
+             | -t ) 
+                    if [[ -n "$1" && "$1" != "-" ]]; then
+                      assigned_to="$1"; shift 
+                      [[ "${assigned_to}" != *@* ]] && assigned_to="${assigned_to}@yahoo-inc.com"
+                    else
+                      assigned_to=""
+                    fi
+                    ;;
+       --prodcomp \
+           | --pc )
+                    prodcomp "$1"
+                    shift
+                    ;;
+        --product ) 
+                    prodcomp "${1%:}:"
+                    shift
+                    ;;
+      --component \
+         | --comp \
+             | -c )
+                    prodcomp ":${1#:}"
+                    shift
+                    ;;
+     --components \
+             | -C )
+                    show_components "${1:-Lego}"
+                    exit $?
+                    ;;
+           --task ) 
+                    bugtype="Task"
+                    ;;
+         --defect ) 
+                    bugtype="Defect"
+                    ;;
+         --rollup ) 
+                    bugtype="Rollup"
+                    ;;
+               :* )
+                    add_subject "${arg#:}"
+                    ;;
+                + \
+       | --master )
+                    find_master=-yes-
+                    ;;
+               +* )
+                    depends_on="${depends_on:+${depends_on},}${arg#+}"
+                    ;;
+          --debug \
+             | -d ) 
+                    debug=-yes- 
+                    ;;
+             --me )
+                    assigned_to="${USER}@yahoo-inc.com"
+                    ;;
+               -- )
+                    if [[ -n "${args[*]}" ]]; then
+                      echo "end of options (--) must come before any non-options (${args[@]})"
+                      rc=1
+                    else 
+                      args=( "${args[@]}" "$@" )
+                      shift $#
+                    fi
+                    ;;
+              --* ) 
+                    add_subject "${arg#--}"
+                    ;;
+               :* ) 
+                    add_subject "${arg#:}"
+                    ;;
+               -* ) 
+                    echo "unknown argument: ${arg}"
+                    rc=1 
+                    ;;
+                * ) 
+                    args=( "${args[@]}" "${arg}" ) 
+                    ;;
+  esac
+done
+
+[[ $rc -ne 0 ]] && exit $rc
+
+subject="${prefix}${subject} ${args[*]}"
+
+opts=( )
+
+find_master_bug_id() {
+  ybug search --cache 300 --product "${product:-${gm_product}}" --component "${component:-${gm_component}}" \
+  | grep -E -i '\[(Master|Rollup)\]' \
+  | perl -ne 'BEGIN { $subj=shift; $subj =~ s/\[Master\]//i; push @matches, qr/\[\Q$1\E\]/ while ($subj =~ /\[(.*?)\]/g); } $c=0; for $m (@matches) {$c++ if (/$m/)}; if ($c == @matches) { s/\s.*//; print "$_\n"; exit; }' "$1"
+}
+
+add_opt() {
+  local opt value
+  opt="$1"; shift
+  value="$1"; shift
+  while [[ "${opt}" == -* ]]; do
+    opt="${opt#-}"
+  done
+  if [[ -z "${value}" ]]; then
+    value="${!opt}"
+  fi
+  if [[ -n "${opt}" && -n "${value}" ]]; then
+    opts=( "${opts[@]}" "--${opt}=${value}" )
+  fi
+}
+
+if [[ -n "${find_master}" ]]; then
+  [[ -n "${debug}" ]] && echo "+ Finding the master bug..." 1>&2
+  blocked="${blocked:+${blocked},}$(find_master_bug_id "${subject}")"
+fi
+
+if [[ "${bugtype}" == Defect && "${product}/${component}" == "${gm_product}/${gm_component}" ]]; then
+  add_subject "${bugtype}"
+elif [[ "${bugtype}" == Task && "${product}/${component}" != "${gm_product}/${gm_component}" ]]; then
+  add_subject "${bugtype}"
+fi
+
+if [[ -n "${requested_priority}" && -z "${requested_severity}" ]]; then
+  if [[ "${product}" != "${gm_product}" \
+     || "${component}" != "${gm_component}" ]]; then
+    echo "Requested a PRIORITY ${requested_priority} on an external ticket."
+    echo "Setting SEVERITY instead."
+    echo "Waiting 5 seconds for you to read this before continuing..."
+    sleep 5
+    requested_severity="S${requested_priority#P}"
+    requested_priority=""
+  fi
+fi
+
+[[ -n "${requested_priority}" ]] && set_priority "${requested_priority}"
+[[ -n "${requested_severity}" ]] && set_severity "${requested_severity}"
+
+add_opt --short_desc   "${subject}" 
+add_opt --product      "${product}"
+add_opt --component    "${component}"
+add_opt --assigned_to  "${assigned_to}"
+add_opt --bug_file_loc "${url}"
+add_opt --bugtype      "${bugtype}"
+add_opt --dependson    "${dependson}"
+add_opt --blocked      "${blocked}"
+add_opt --priority     "${priority}"
+add_opt --bug_severity "${bug_severity}"
+add_opt --cc           "${cc}"
+add_opt --keywords     "${keywords}"
+add_opt --comment      "${comment}"
+
+debug_cmd() {
+  if [[ -n "${debug}" ]]; then
+    echo + "$@"
+  else
+    "$@"
+  fi
+}
+
+debug_cmd ybug create -e "${opts[@]}"
+

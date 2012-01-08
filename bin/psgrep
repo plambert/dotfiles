@@ -1,0 +1,31 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use warnings;
+
+my @ps=("ps", "auxww");
+my $regexp;
+my $process_name='***PSGREP***';
+my $process_regexp="\\s" . quotemeta($process_name) . "(?:\\s|\$)";
+
+if (@ARGV == 1 and $ARGV[0] =~ /^[1-9]\d*$/) {
+  $regexp='^\w+\s+' . $ARGV[0] . '\s+';
+}
+elsif (@ARGV) {
+  $regexp=join('|', map { "(?:$_)" } (@ARGV));
+}
+
+# change my process name, so it's easier to remove me from the list...
+
+$0=$process_name;
+
+if (open(PS, "-|", @ps)) {
+  while(defined(my $line=<PS>)) {
+    next if ($line =~ /${process_regexp}/o);
+    print $line if ($regexp and $line =~ m/${regexp}/io);
+  }
+  close(PS) || die "$0: '" . join(' ', @ps) . "': execution failed: $!\n";
+}
+else {
+  die "$0: '" . join(' ', @ps) . "': could not fork/exec: $!\n";
+}

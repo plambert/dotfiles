@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# find all Mail.app emails from bugzilla in the last 7 days, and return their bug ids
+
+mdfind -0 'kMDItemAuthorEmailAddresses == bugs@yahoo-inc.com && kMDItemContentCreationDate >= $time.today(-7)' \
+| xargs -0 mdls -name kMDItemSubject \
+| perl -ne 'print "$1\n" if (/\[Ticket (\d{7,})\]/)' \
+| sort -n -u \
+| xargs printf "http://bug.corp.yahoo.com/show_bug.cgi?id=%s\n"
+

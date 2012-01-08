@@ -1,0 +1,104 @@
+#!/bin/bash
+
+# Watch MOAB on #mediaops-triage, and use growlnotify to show when a message appears that
+# matches a set of accept/deny filters...
+
+accept_regexes=( )
+deny_regexes=( )
+default_action=accept
+
+die() {
+  local why
+  local rc
+  local msg
+  case $# in
+    0 ) why=UNKNOWN; msg="died"   ;;
+    1 ) why=UNKNOWN; msg="$1"     ;;
+    * ) why="$1"; shift; msg="$*" ;;
+  esac
+  case "${why}" in
+    IRC_LOG_DATE_FORMAT | 2 ) rc=2                ;;
+                          * ) rc=1; why="UNKNOWN" ;;
+  esac
+  echo "$0 died with error ${rc} (${why}) at ${FUNCNAME[1]:-main}:${BASH_LINENO[0]} : ${msg}" 1>&2
+  exit $rc
+}
+
+irc_log() {
+  local channel="$1"; shift
+  local date="$1"; shift
+  local year
+  local month
+  local day
+  local url
+  if [[ -z "${date}" ]]; then
+    date=$( date +%Y-%m-%d )
+  fi
+  if [[ "${date}" != [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] ]]; then
+    die IRC_LOG_DATE_FORMAT "irc_log: date given as '${date}' isn't in the right format YYYY-MM-DD"
+  fi
+  # if you pipe a string to read, the read happens in a subshell.  so the variable changes are lost
+  # when that subshell exits.  instead, we use the bash <<< operator to provide a given argument as standard input
+  read year month day <<<$(echo "${date//-/ }")
+  url="http://irc1.ops.corp.sk1.yahoo.com/log/${channel###}/${year}/${month}/${date}.txt"
+  curl -L -s -H Pragma: -f "${url}" \
+  | awk '
+    BEGIN {
+      amp["&[\043]32;"]="\040";amp["&nbsp;"]="\040";
+      amp["&[\043]34;"]="\042";amp["&quot;"]="\042";
+      amp["&[\043]39;"]="\047";
+      amp["&[\043]60;"]="\074";amp["&lt;"]="\074";amp["&[\043]62;"]="\076";
+      amp["&gt;"]="\076";amp["&Agrave;"]="\300";amp["&Aacute;"]="\301";
+      amp["&Acirc;"]="\302";amp["&Atilde;"]="\303";amp["&Auml;"]="\304";
+      amp["&Aring;"]="\305";amp["&AElig;"]="\306";amp["&Ccedil;"]="\307";
+      amp["&Egrave;"]="\310";amp["&Eacute;"]="\311";amp["&Ecirc;"]="\312";
+      amp["&Euml;"]="\313";amp["&Igrave;"]="\314";amp["&Iacute;"]="\315";
+      amp["&Icirc;"]="\316";amp["&Iuml;"]="\317";amp["&ETH;"]="\320";
+      amp["&Ntilde;"]="\321";amp["&Ograve;"]="\322";amp["&Oacute;"]="\323";
+      amp["&Ocirc;"]="\324";amp["&Otilde;"]="\325";amp["&Ouml;"]="\326";
+      amp["&Oslash;"]="\330";amp["&Ugrave;"]="\331";amp["&Uacute;"]="\332";
+      amp["&Ucirc;"]="\333";amp["&Uuml;"]="\334";amp["&Yacute;"]="\335";
+      amp["&THORN;"]="\336";amp["&szlig;"]="\337";amp["&agrave;"]="\340";
+      amp["&aacute;"]="\341";amp["&acirc;"]="\342";amp["&atilde;"]="\343";
+      amp["&auml;"]="\344";amp["&aring;"]="\345";amp["&aelig;"]="\346";
+      amp["&ccedil;"]="\347";amp["&egrave;"]="\350";amp["&eacute;"]="\351";
+      amp["&ecirc;"]="\352";amp["&euml;"]="\353";amp["&igrave;"]="\354";
+      amp["&iacute;"]="\355";amp["&icirc;"]="\356";amp["&iuml;"]="\357";
+      amp["&eth;"]="\360";amp["&ntilde;"]="\361";amp["&ograve;"]="\362";
+      amp["&oacute;"]="\363";amp["&ocirc;"]="\364";amp["&otilde;"]="\365";
+      amp["&ouml;"]="\366";amp["&oslash;"]="\370";amp["&ugrave;"]="\371";
+      amp["&uacute;"]="\372";amp["&ucirc;"]="\373";amp["&uuml;"]="\374";
+      amp["&yacute;"]="\375";amp["&thorn;"]="\376";amp["&yuml;"]="\377";
+      amp["&reg;"]="\256";amp["&copy;"]="\251";amp["&[\043]163;"]="\243";
+      amp["&shy;"]="-";
+    }
+    /^<tr ><td><a name="..:..:.."<\/a>..:..:..<\/td><td><font color=[^ ]+ size=[^>]+>[^<]+<\/font><\/td><td valign=top>&lt;moab&gt;/ { 
+      sub(/^<tr ><td><a name="..:..:.."<\/a>/, "");
+      sub(/<\/td><td><font[^>]+>[^<]+<\/font><\/td><td valign=top>&lt;moab&gt;/, "");
+      sub(/ *<\/td><\/tr> *$/, "");
+      for(x in amp){gsub(x, amp[x], $0);};
+      print;
+    }'
+}
+
+tail_irc_log() {
+  local channel="$1"; shift
+  local tmpdir="${TMPDIR:-/tmp}"
+  local tmpfile="${tmpdir%/}/.moab_${channel###}_${UID}_tmp"
+  local previous_length=0
+  local current_length
+  if [[ -f "${tmpfile}" ]]; then
+    previous_length=$(wc -l < "${tmpfile}")
+  fi
+  irc_log "${channel}" > "${tmpfile}"
+  current_length=$(wc -l < "${tmpfile}")
+  if [[ "${current_length}" -gt "${previous_length}" ]]; then
+    tail -n "$((current_length - previous_length))" "${tmpfile}"
+  elif [[ "${current_length}" -lt "${previous_length}" ]]; then
+    cat "${tmpfile}"
+  fi
+  echo "${current_length}, ${previous_length}"
+}
+
+tail_irc_log "#mediaops-triage"
+

@@ -1,0 +1,37 @@
+#!/bin/bash
+
+sleeprc=0
+sshrc=0
+
+clear
+
+runlog() {
+  echo "$(date):"
+  printf "    "
+  printf "%q " "$@"
+  printf "\n"
+  "$@"
+}
+
+while [[ $sleeprc -eq 0 ]]; do
+  runlog ssh \
+    -o ExitOnForwardFailure=yes \
+    -R :5902:localhost:5900 \
+    -R :8008:localhost:1080 \
+    -L 5912:pinky.plambert.net:5900 \
+    brain.plambert.net \
+    sleep 86400
+  sshrc=$?
+  [[ $sshrc -ne 0 && $sshrc -ne 255 ]] && break
+  sleep 5
+  sleeprc=$?
+done
+
+echo sshrc=${sshrc} sleeprc=${sleeprc}
+
+case $sleeprc in
+  130 ) echo "exiting."; exit $sleeprc ;;
+  0 ) echo "ssh: exit with return code ${sshrc}"; exit $sshrc ;;
+  * ) echo "sleep: exit with return code ${sleeprc}"; exit $sleeprc ;;
+esac
+

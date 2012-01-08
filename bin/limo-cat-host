@@ -1,0 +1,325 @@
+#!/usr/local/bin/perl -w
+
+# do limo-cat but without garbage, and optionally prepended hostname to each output line
+
+my $limo_id='last';
+my @hosts;
+my $host="";
+my $host_length=0;
+my %status;
+my %timefinished;
+my %rc;
+my %output;
+my @include_line_filters;
+my $include_line_regexp;
+my @exclude_line_filters;
+my $exclude_line_regexp;
+my @include_hosts;
+my $include_host_regexp;
+my @exclude_hosts;
+my $exclude_host_regexp;
+my $filter_yinst;
+my $tail_lines;
+my $rc_ok=sub { 1; };
+my $prepend=defined($ENV{LIMOCATHOST_PREPEND}) ? $ENV{LIMOCATHOST_PREPEND} : 1;
+my $quiet;
+my $completed=1;
+my $limo_cache_dir=defined($ENV{LIMOCACHEDIR}) ? $ENV{LIMOCACHEDIR} : "$ENV{HOME}/.limo_cache";
+my $limo_cache_file;
+my $limo;
+my $line;
+
+sub usage {
+  print "usage: $0 [options] [limo job id]\n";
+  if(open(ME, "<", __FILE__)) {
+    while(<ME>) {
+      print if (s{^\s*###\s}{});
+    }
+    close(ME);
+  }
+}
+
+unless (-d $limo_cache_dir) {
+  if (defined($ENV{LIMOCACHEDIR})) {
+    mkdir $limo_cache_dir, 0700 or die "$0: ${limo_cache_dir}: cache dir could not be created: $!\n";
+  }
+  else {
+    die "$0: ${limo_cache_dir}: cache dir does not exist; either create it or define LIMOCACHEDIR in your environment to be a non-existent directory\n";
+  }
+}
+
+my $default_line_filters={
+  'DEFAULT' => [ qw{SUDO BLANK LIMO-PW} ],
+  'BLANK' => '^\s*$',
+  'SUDO' => [ 
+    '^\s*We trust you have received the usual lecture from the local System\s*$',
+    '^\s*Administrator. It usually boils down to these three things:\s*$',
+    '^\s*\#1\) Respect the privacy of others.\s*$',
+    '^\s*\#2\) Think before you type.\s*$',
+    '^\s*\#3\) With great power comes great responsibility.\s*$',
+  ],
+  'LIMO-PW' => '^\s*Password:\s+\(supplied by limo-pw\)\s*$',
+  'YINST-RESTORE' => '^(?:yinst: )?(WARNING:|Save time:|Setting Changes:|Package Changes:)',
+};
+
+# make a single -h argument give help
+if (1==@ARGV and $ARGV[0] eq '-h') {
+  @ARGV=('--help');
+}
+
+while (defined($ARGV[0])) {
+  my $opt=shift @ARGV;
+  if ($opt =~ /^-(m|-?match)$/) {
+    my $filter=shift @ARGV;
+    push @include_line_filters, default_line_filter_for($filter);
+  }
+  elsif ($opt =~ /^-(x|-?exclude)$/) {
+    my $filter=shift @ARGV;
+    push @exclude_line_filters, default_line_filter_for($filter);
+  }
+  elsif ($opt =~ /^--exclude[-_](\S*)$/ and exists($default_line_filters->{uc($1)})) {
+    my $filter=$1;
+    push @exclude_line_filters, default_line_filter_for('DEFAULT') unless (@exclude_line_filters);
+    push @exclude_line_filters, default_line_filter_for($filter);
+  }
+  elsif ($opt =~ /^-(h|-?host)$/) {
+    push @include_hosts, shift @ARGV;
+  }
+  elsif ($opt =~ /^-(H|-?(?:exclude|no)[-_]host)$/) {
+    push @exclude_hosts, shift @ARGV;
+  }
+  elsif ($opt =~ /^-(y|-?yinst)$/) {
+    $filter_yinst=1;
+  }
+  elsif ($opt =~ /^-(t|-?tail)$/) {
+    $tail_lines=shift @ARGV;
+  }
+  elsif ($opt =~ /^-(s|-?succe(eded|ss))$/) {
+    $rc_ok=sub { $_[0] != 0 };
+  }
+  elsif ($opt =~ /^-(f|-?fail(ed)?)$/) {
+    $rc_ok=sub { $_[0] == 0 };
+  }
+  elsif ($opt =~ /^-(n|-?nohost)$/) {
+    $prepend=0;
+  }
+  elsif ($opt =~ /^-(p|-?prepend)$/) {
+    $prepend=1;
+  }
+  elsif ($opt =~ /^-(q|-?quiet)$/) {
+    $quiet=1;
+  }
+  elsif ($opt =~ /^[0-9A-Z]{6,8}$/) {
+    if ($limo_id) {
+      die "$0: ${opt}: too many options\n";
+    }
+    else {
+      $limo_id=$opt;
+    }
+  }
+  else {
+    die "$0: ${opt}: unknown option\n";
+  }
+}
+
+if (!$limo_id or $limo_id eq 'last') {
+  if (-x "/home/y/libexec/limo/limo-last-id") {
+    $limo_id=`/home/y/libexec/limo/limo-last-id`;
+    chomp $limo_id;
+  }
+}
+
+if (@include_line_filters) {
+  $include_line_regexp=join("|", map { "(?:$_)" } (@include_line_filters));
+  $include_line_regexp=qr{${include_line_regexp}};
+}
+
+@exclude_line_filters=(default_line_filter_for('DEFAULT')) unless (@include_line_filters or @exclude_line_filters);
+
+if (@exclude_line_filters) {
+  $exclude_line_regexp=join("|", map { "(?:$_)" } (@exclude_line_filters));
+  $exclude_line_regexp=qr{${exclude_line_regexp}};
+}
+
+if (@include_hosts) {
+  ($include_host_regexp, $include_host_specific) = parse_host_list(@include_hosts);
+}
+
+if (@exclude_hosts) {
+  ($exclude_host_regexp, $exclude_host_specific) = parse_host_list(@exclude_hosts);
+}
+
+if (-f "${limo_cache_dir}/${limo_id}.status") {
+  print STDERR "Using cached limo status for job ${limo_id}\n" unless ($quiet);
+  open(STATUS, "<", "${limo_cache_dir}/${limo_id}.status") or die "$!";
+  @status=<STATUS>;
+  close(STATUS);
+}
+else {
+  print STDERR "Getting status for job ${limo_id}\n" unless ($quiet);
+  open(STATUS, "-|", "limo-status", $limo_id) or die "$!";
+  @status=<STATUS>;
+  close(STATUS);
+}
+
+for $line (@status) {
+  $limo_id=$1 if ($limo_id eq 'last' and $line =~ m{^Job ID:\s+(\S+)\s*$});
+  next unless ($line =~ m{^(\S+\.\S+)\s+(\S+)\s+(\S+)\s+(\d+|-)\s*$});
+  my ($h, $s, $t, $r) = ($1, $2, $3, $4);
+  push @hosts, $h;
+  $status{$h}=$s;
+  $timefinished{$h}=$t;
+  if ($r eq '-') {
+    $rc{$h}='  -';
+    $completed=0;
+  }
+  else {
+    $rc{$h}=sprintf("%03d", $r);
+  }
+  $host_length=length($h) if (length($h) > $host_length);
+}
+
+if ($completed and ! -f "${limo_cache_dir}/${limo_id}.status") {
+  if (open(STATUS, ">", "${limo_cache_dir}/${limo_id}.status")) {
+    print STATUS @status;
+    close(STATUS);
+  }
+}
+
+if ($completed and -f "${limo_cache_dir}/${limo_id}") {
+  if (open($limo, "<", "${limo_cache_dir}/${limo_id}")) {
+    print STDERR "Using cached limo output for job ${limo_id}\n" unless ($quiet);
+  }
+}
+
+if (!$limo) {
+  unless (open($limo, "-|", "limo-cat", $limo_id)) {
+    die "Unable to run limo-cat ${limo_id}: $!\n";
+  }
+}
+
+if ($completed and ! -f "${limo_cache_dir}/${limo_id}") {
+  unless (open($limo_cache_file, ">", "${limo_cache_dir}/${limo_id}")) {
+    undef $limo_cache_file;
+  }
+}
+
+while(defined($line=<$limo>)) {
+  print $limo_cache_file $line if ($limo_cache_file);
+  $line =~ s/[\cM|\n]+$//s;
+  if ($line =~ m{^(Connection to ${host} closed\.|[a-z0-9_]+\@${host}'s password:.*|\s*)$}) {
+    next;
+  }
+  elsif ($line =~ m{^>>> Host: (\S+)$}) {
+    $host=$1;
+    next;
+  }
+  if ($filter_yinst) {
+    $line =~ s/^yinst:\s//;
+  }
+  if (! $exclude_line_regexp or $line !~ /${exclude_line_regexp}/oi) {
+    if (! $include_line_regexp or $line =~ /${include_line_regexp}/oi) {
+      push @{$output{$host}}, $line;
+      if ($tail_lines and @{$output{$host}} > $tail_lines) {
+        shift @{$output{$host}};
+      }
+    }
+  }
+}
+close($limo) or die "$0: limo-cat failed: $!\n";
+close($limo_cache_file) if ($limo_cache_file);
+
+@hosts=sort { hostkey($a) cmp hostkey($b) } (@hosts);
+
+for $host (@hosts) {
+  next if (defined($include_host_regexp) and $host !~ /${include_host_regexp}/oi);
+  next unless ($rc_ok->($rc{$host}));
+  printf "%${host_length}s\t%s\tRC=%3s\tFinished=%-20s\n", $host, $status{$host}, $rc{$host}, $timefinished{$host} unless ($quiet);
+  if ($prepend) {
+    printf "%${host_length}s\t%s\n", $host, $_ for (@{$output{$host}});
+  }
+  else {
+    printf "%s\n", $_ for (@{$output{$host}});
+  }
+}
+
+sub hostkey {
+  my $hostname=shift;
+  $hostname=join('.', reverse split(/\./, $hostname));
+  $hostname =~ s/(\d+)/sprintf "%09d", $1/eg;
+  return $hostname;
+}
+
+sub default_line_filter_for {
+  my $filter=shift;
+  my @filters;
+  my $new_filter;
+  if (exists $default_line_filters->{$filter}) {
+    return default_line_filter_for($default_line_filters->{$filter});
+  }
+  elsif (!ref($filter)) {
+    return $filter;
+  }
+  elsif (ref($filter) eq 'ARRAY') {
+    if (defined($filter->[0]) and ref($filter->[0]) eq 'CODE') {
+      my $func=shift(@$filter);
+      return $func->(@$filter);
+    }
+    else {
+      return map { default_line_filter_for($_) } (@$filter);
+    }
+  }
+  elsif (ref($filter) eq 'CODE') {
+    return $filter->();
+  }
+  else {
+    die "$0: unknown filter type: ${filter}\n";
+  }
+}
+
+# given a list of regexes and host ranges, return a combined regex and a list of igor expanded hosts
+sub parse_host_list {
+  my $hosts;
+  my @ranges;
+  my @regexes;
+  my $regex;
+  for my $list (@_) {
+    for my $entry (split(/[\s,]+/, $list)) {
+      if ($entry =~ m{^/(.*)/?$}) {
+        push @regexes, $1;
+      }
+      elsif ($entry =~ m{^~(.*)$}) {
+        push @regexes, $1;
+      }
+      elsif ($entry =~ /^([a-z][a-z0-9-]*\.)+[a-z][a-z0-9-]*\.?$/) {
+        $hosts->{$entry}+=1;
+      }
+      else {
+        push @ranges, $entry;
+      }
+    }
+  }
+  if (@ranges) {
+    # hide STDERR
+    open(SAVESTDERR, ">&STDERR");
+    open(STDERR, ">", "/dev/null");
+    if (open(YINST_RANGE, "-|", "yinst", "range", "-igor_range", join(",", @ranges))) {
+      while(defined(my $host = <YINST_RANGE>)) {
+        chomp($host);
+        next unless ($host =~ /^[a-z][a-z0-9-]*\.(.+\.)?[a-z0-9]{2,3}$/);
+        $hosts->{$host} += 1;
+      }
+      close(YINST_RANGE) or die "$0: yinst: command failed: $!\n";
+    }
+    else {
+      die "$0: yinst: yinst range command failed: $!\n";
+    }
+    open(STDERR, ">&SAVESTDERR");
+    close(SAVESTDERR);
+  }
+  if (@regexes) {
+    $regex="(?:" . join("|", @regexes) . ")";
+  }
+  return($regex, $hosts);
+}
+

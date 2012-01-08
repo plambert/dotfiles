@@ -1,0 +1,149 @@
+#!/usr/local/bin/perl -w
+
+# quote arguments as bash strings
+
+package Quote;
+
+use strict;
+use warnings;
+
+my $pasteboard;
+my $chomp;
+my @strings;
+
+sub bash {
+  my $string=shift;
+  if (!defined($string)) {
+    return undef;
+  }
+  elsif (length($string) == 0) {
+    return "''";
+  }
+  else {
+    my $quoted_string=bash_dollar($string);
+    for my $shorter_string (bash_single($string), bash_double($string), bash_escape($string)) {
+      if (defined($shorter_string) and length($shorter_string) < length($quoted_string)) {
+        $quoted_string=$shorter_string;
+      }
+    }
+    return $quoted_string;
+  }
+}
+
+# it's not possible to quote a ' inside a '-delimited string in bash.
+# nor is it possible to visibly quote a tab or other "special" characters...
+# so we only single-quote strings that have whitespace, but no other non-printable characters.
+sub bash_single {
+  my $string=shift;
+  if ($string !~ / / or $string =~ /[^a-zA-Z0-9_,.\/@%+=\- ]/) {
+    return undef;
+  }
+  return "'${string}'";
+}
+
+# double-quotes strings are literal, except for the ", ', and \ characters.
+# the \ character has special meaning only when followed by a ", ', \, or newline.
+# we won't double-quote strings with newlines, unprintable characters, et al.
+sub bash_double {
+  my $string=shift;
+  if ($string =~ /[^a-zA-Z0-9`~!@#$%^&*()\-=+\[\]\{\}'";:,<.>\/?\\| _]/) {
+    return undef;
+  }
+  $string =~ s/(['"\\])/\\$1/g;
+  return '"' . $string . '"';
+}
+
+# bash escaped strings are literal, except with escapes for characters specific to bash.
+sub bash_escape {
+  my $string=shift;
+  if ($string =~ /[^a-zA-Z0-9`~!@#$%^&*()\-=+\[\]\{\}'";:,<.>\/?\\| _]/) {
+    return undef;
+  }
+  $string =~ s/([^a-zA-Z0-9@%_\-=+,.])/\\$1/g;
+  return $string;
+}
+
+{ my @quoted_char;
+sub bash_dollar { 
+  my $string=shift;
+  my $new_string='';
+  unless (@quoted_char) {
+    my %escape=( "\e" => '\e', "\t" => '\t', "\n" => '\n', "\r" => '\r', "\\" => '\\\\');
+    for my $char ('a'..'z', 'A'..'Z', '-', '_', ',', '.', '/', '@', ' ', '%', '#', '+', '=', '0'..'9', '<', '>', '?', ':', ';', '[', ']', '"', '!', '$', '^', '&', '*', '(', ')', '{', '}') {
+      $quoted_char[ord($char)] = $char;
+    } 
+    for my $control_character (1..26) {
+      $quoted_char[$control_character] = '\c' . chr(64+$control_character);
+    } 
+    for my $escape (keys %escape) {
+      $quoted_char[ord($escape)]=$escape{$escape};
+    } 
+    for my $remaining_character (0..255) {
+      if (! defined($quoted_char[$remaining_character])) {
+        $quoted_char[$remaining_character] = '\x' . unpack('H4', chr($remaining_character));
+      }
+    } 
+  } 
+  while(length($string) > 0) {
+    my $char=substr($string, 0, 1);
+    $string=substr($string, 1);
+    $new_string .= $quoted_char[ord($char)];
+  }
+  $new_string="\$'${new_string}'" if ($new_string =~ /[ \\]/);
+  return $new_string;
+} } 
+
+sub RUN {
+  my $pkg=shift;
+  my @args=@_;
+  while (defined($args[0]) and $args[0] =~ /^-/) {
+    my $opt=shift @args;
+    if ($opt eq '-p') {
+      $pasteboard=1;
+    }
+    elsif ($opt eq '-c') {
+      $chomp=1;
+    }
+    elsif ($opt eq '-r') {
+      die "$0: random option not implemented yet...\n";
+    }
+    elsif ($opt eq '-') {
+      undef $/;
+      push @args, scalar(<>);
+      last;
+    }
+    elsif ($opt eq '--') {
+      last;
+    }
+    else {
+      die "unknown option: \"${opt}\"\n";
+    }
+  }
+
+  push @strings, @args;
+
+  if ($pasteboard) {
+    if (-x "/usr/bin/pbpaste") {
+      push @strings, `/usr/bin/pbpaste`;
+    }
+    else {
+      die "only know how to do pasteboard/clipboard on mac os x, sorry!\n";
+    }
+  }
+
+  if (@args) {
+    for my $string (@args) {
+      print bash($string), "\n";
+    }
+  }
+  else {
+    undef $/;
+    my $string=<>;
+    print bash($string), "\n";
+  }
+}
+
+__PACKAGE__->RUN(@ARGV) if !caller() || caller() eq 'PAR';
+
+1;
+

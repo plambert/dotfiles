@@ -1,0 +1,95 @@
+#!/usr/local/bin/perl -w
+
+use strict;
+use warnings;
+use constant { SUB_MATCH => 1, FULL_MATCH => 2 };
+
+my $mult=1;
+my %mult_for=(
+  'b' => 2**0,
+  'k' => 2**10,
+  'm' => 2**20,
+  'g' => 2**30,
+);
+my $regexp;
+my $regexp_mode;
+my $width;
+my $format='%.2f%s';
+
+sub usage {
+  push @_, "" if (@_);
+  print STDERR map { "$_\n" } (@_);
+  print "usage: $0 [options] [file ...]\n";
+  print "\n";
+  print "options:\n";
+  print "  -h | --help       This help\n";
+  print "  -b | -k | -m | -g Numbers are in gigabytes\n";
+  print "  -<number>         Numbers are in multiples of <number> bytes\n";
+  print "  -w <number>       Substituted values are <number> chars wide\n";
+  print "  -r                Regular expression which is entirely replaced with its FIRST match\n";
+  print "  -R                Regular expression whose SECOND match is the number to replace\n";
+  print "  --ls              Shortcut for -w 8 -R '(\\S+\\s+\\S+\\s+\\S+\\s)\\s*(\\d+)(.*)'\n";
+  print "\n";
+  exit(@_ != 0);
+}
+
+sub readable {
+  my $number=shift;
+  my $bytes=$number * $mult;
+  my @label=(" ", "K", "M", "G");
+  while($#label > 0 and $bytes >= 1024) {
+    $bytes = $bytes / 1024.0;
+    shift @label;
+  }
+  return sprintf($format, $bytes, $label[0]);
+}
+
+while(defined($ARGV[0]) and $ARGV[0] =~ /^-/) {
+  my $opt=shift;
+  if ($opt eq '-h' or $opt eq '--help') {
+    usage();
+  }
+  elsif ($opt =~ /^-([bkmg])$/i) {
+    $mult=$mult_for{lc($1)} || 1;
+  }
+  elsif ($opt =~ /^-(\d+)$/) {
+    $mult=int($1);
+  }
+  elsif ($opt =~ /^-r$/) {
+    $regexp=shift;
+    $regexp_mode=FULL_MATCH;
+  }
+  elsif ($opt =~ /^-R$/) {
+    $regexp=shift;
+    $regexp_mode=SUB_MATCH;
+  }
+  elsif ($opt =~ /^-w$/) {
+    $width=(shift) - 1;
+    $format=sprintf("%%%s.%df%%s", ($width > 3 ? $width : ''), 2);
+  }
+  elsif ($opt =~ /^--ls$/) {
+    unshift @ARGV, '-w', 8, '-R', '(\S+\s+\S+\s+\S+\s)\s*(\d+)(.*)';
+  }
+  else {
+    usage("unknown option: '${opt}'");
+  }
+}
+
+if (! defined($regexp_mode) ) {
+  while(<>) {
+    s/(\d+)/readable($1)/eg;
+    print;
+  }
+}
+elsif ($regexp_mode == SUB_MATCH) {
+  while(<>) {
+    s/${regexp}/$1 . readable($2) . $3/eg;
+    print;
+  }
+}
+elsif ($regexp_mode == FULL_MATCH) {
+  while(<>) {
+    s/${regexp}/readable($1 || $&)/eg;
+    print;
+  }
+}

@@ -1,0 +1,36 @@
+#!/usr/local/bin/perl -w
+
+# create a bug using ybug, but also allow shortcut options
+
+use strict;
+use warnings;
+use Yahoo::Bugzilla::CommandLineInterface;
+
+my $cli=Yahoo::Bugzilla::CommandLineInterface->new_from_config;
+my @arguments;
+
+# default aliases
+
+my $alias={
+  'me' => [ '--assign_to', $ENV{USER} ],
+};
+
+my $alias_regexp='^--?(' . join('|', keys %$alias) . ')$';
+
+# pre-process arguments from @ARGV; we assume a 'command' of create...
+
+push @arguments, 'create';
+
+while(@ARGV) {
+  my $opt=shift @ARGV;
+  if ($opt =~ /${alias_regexp}/oi) {
+    push @arguments, @{$alias->{$1}};
+  }
+  else {
+    push @arguments, $opt;
+  }
+}
+
+use Data::Dumper; $Data::Dumper::Terse=1; print Dumper(\@arguments);
+
+

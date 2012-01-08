@@ -1,0 +1,108 @@
+#!/usr/local/bin/perl -w
+
+# Call curl on a file, but with backyard authentication.
+
+# Uses Yahoo::Backyard::SingleSignOn to get the backyard
+# admin page to ensure the cookies are up to date, then
+# gets the cookies from the SSO object, and then calls 
+# curl with them as arguments, plus all arguments given 
+# on the command line.
+
+# $Id:$
+
+use 5.008;
+use strict;
+use Yahoo::Backyard::SingleSignOn;
+
+my $url='https://bouncer.by.corp.yahoo.com/admin/';
+my $sso=Yahoo::Backyard::SingleSignOn->new;
+
+my @cookies;
+my $cookies;
+my $curl="curl";
+my $by_cookie_file = $sso->{COOKIE_FILE};
+my @curl_args;
+my $hide_pragma=1;
+my $dryrun=0;
+
+for my $path (split(':', $ENV{PATH})) {
+  if (-f "${path}/curl" && -x _) {
+    $curl="${path}/curl";
+    last;
+  }
+}
+
+sub usage {
+  my $scriptname=$0;
+  $scriptname =~ s{.*/}{};
+  my %options=(
+  "--no-hide-pragma" => "By default, ${scriptname} passes -H Pragma: to curl; this option disables that.",
+          "--dryrun" => "Updates and verifies the SSO cookies, but only shows what curl command it would run.",
+            "--help" => "Shows this help for ${scriptname}; for curl help, run it directly or use --curl-help.",
+                "--" => "All options after this are only passed to curl.",
+  );
+  print "usage: ${scriptname} [${scriptname} options and/or curl options] [-- [curl options ...]]\n";
+  print "options:\n";
+  my $length=0;
+  for my $opt (sort keys %options) {
+    if (length($opt) > $length) {
+      $length=length($opt);
+    }
+  }
+  for my $opt (sort keys %options) {
+    next if ($opt eq '--');
+    printf "  %${length}s %s\n", $opt, $options{$opt};
+  }
+  printf "  %${length}s %s\n", '--', $options{'--'};
+  exit 0;
+}
+
+usage if (@ARGV == 0);
+
+while (defined(my $arg = shift @ARGV)) {
+  if ($arg eq '--no-hide-pragma') {
+    $hide_pragma=0;
+  }
+  elsif ($arg eq '--dryrun') {
+    $dryrun=1;
+  }
+  elsif ($arg eq '--help') {
+    usage;
+  }
+  elsif ($arg eq '-h' and ! defined $ARGV[0]) {
+    usage;
+  }
+  elsif ($arg eq '--') {
+    push @curl_args, @ARGV;
+    @ARGV=();
+  }
+  else {
+    push @curl_args, $arg;
+  }
+}
+
+unless (-f $by_cookie_file and (stat($by_cookie_file))[9] > time - 3600) {
+  $sso->login;
+  system('stty', 'reset');
+  $sso->get($url);
+  if (! $sso->success()) {
+    print STDERR "failed to get sso url: " . $sso->res->status_line . "\n";
+    exit 1;
+  }
+}
+
+$sso->cookie_jar->scan( sub { push @cookies, "$_[1]=$_[2]"; } );
+$cookies = join(";", @cookies);
+unshift @curl_args, '-b', $cookies;
+
+if ($hide_pragma) {
+  unshift @curl_args, "-H", "Pragma:";
+}
+
+if ($dryrun) {
+  print "${curl} ", join(' ', map { /[^a-zA-Z0-9_-]/ ? "'$_'" : $_ } (@curl_args)), "\n";
+}
+else {
+  exec $curl, @curl_args;
+}
+

@@ -1,0 +1,99 @@
+#!/bin/bash
+
+quiet=
+show_filetype=-YES-
+
+if [[ "$(uname)" == *Linux* ]]; then
+  mtime() {
+    command stat -c %Y "$@"
+  }
+  filetype_command() {
+    command stat -c %F "$@"
+  }
+else
+  mtime() {
+    command stat -f %m "$@"
+  }
+  filetype_command() {
+    command stat -f %T "$@"
+  }
+fi
+
+filetype() {
+  local f="$1"
+  local t="$(filetype_command "${f}")"
+  case "$t" in
+    directory ) echo "/" ;;
+    file ) echo " " ;;
+    "symbolic link" ) echo " -> $(readlink "${f}")" ;;
+    * ) echo "${t}" ;;
+  esac
+}
+
+file_age() {
+  local f="$1"
+  local mt="$(mtime "${f}")"
+  local d h m s
+  [[ -z "${now}" ]] && now="$(date +%s)"
+  s="$(( $now - $mt ))"
+  m=$(( $s / 60 ))
+  s=$(( $s - 60 * $m ))
+  h=$(( $m / 60 ))
+  m=$(( $m - 60 * $h ))
+  d=$(( $h / 24 ))
+  h=$(( $h - 24 * $d ))
+  if [[ "$d" -gt 1 ]]; then
+    printf "%d days ago\n" "$d"
+  elif [[ "$h" -gt 1 ]]; then
+    printf "%d hours ago\n" "$h"
+  elif [[ "$m" -gt 1 ]]; then
+    printf "%d:%02d ago\n" "$m" "$s"
+  elif [[ "$s" -gt 1 ]]; then
+    printf "%d sec ago\n" "$s"
+  else
+    printf "just now\n"
+  fi
+}
+
+toggle_var() {
+  local v
+  for v in "$@"; do
+    if [[ -n "${!v}" ]]; then
+      eval "${v}="
+    else
+      eval "${v}=-YES-"
+    fi
+  done
+}
+
+
+case "$( basename "$0" )" in
+  mtime ) mode=mtime; quiet=-YES-; show_filetype="" ;;
+  * ) mode=file_age ;;
+esac
+
+while [[ -n "$1" && "$1" == -* ]]; do
+  opt="$1"; shift
+  case "${opt}" in
+    -s | --seconds ) mode=mtime ;;
+    -t | --time | -a | --age ) mode=file_age ;;
+    -q | --quiet ) toggle_var quiet ;;
+    -F | --filetype ) toggle_var show_filetype ;;
+    -* ) echo "$0: ${opt}: unknown option" 1>&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "${quiet}" && -n "${show_filetype}" ]]; then
+  for f in "$@"; do
+    printf "%13s %s%1.1s\n" "$(${mode} "${f}")" "${f}" "$(filetype "${f}")"
+  done
+elif [[ -z "${quiet}" ]]; then
+  for f in "$@"; do
+    printf "%13s %s\n" "$(${mode} "${f}")" "${f}"
+  done
+else
+  for f in "$@"; do
+    printf "%13s\n" "$(${mode} "${f}")"
+  done
+fi
+

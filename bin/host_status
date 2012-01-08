@@ -1,0 +1,378 @@
+#!/usr/local/bin/perl -w
+
+use 5.008;
+use strict;
+use warnings;
+use Net::Ping::External qw/ping/;
+# yinst install ypan/perl-Net-Ping-External
+use LWP::Simple;
+use Net::DNS;
+use Getopt::Long;
+use File::Basename;
+use Igor::Client;
+
+my $verbose;
+my $columns;
+my $quiet;
+my $lines_per_page=23;
+my $utf8;
+my $host_header;
+my @host_header;
+
+my $utf8_checkmark="\x{02713}";
+my $utf8_cross="\x{02717}";
+my $utf8_dash="\x{02014}";
+my $ascii_checkmark="ok";
+my $ascii_cross="FAIL";
+my $ascii_dash="OOR";
+my $checkmark=sprintf("%4.4s", $ascii_checkmark);
+my $cross=sprintf("%4.4s", $ascii_cross);
+my $dash=sprintf("%4.4s", $ascii_dash);
+
+my $bold="\e[1m";
+my $normal="\e[0m";
+my $reset_color="\e[0m";
+my $color=(-t STDIN);
+
+my %hosts_by_colo;
+my %short_hostnames;
+my $line_count = 0;
+my $curl;
+my $vipselect;
+
+my $igor = Igor::Client->new($Igor::Client::IGOR_DEFAULT_URL);
+
+Getopt::Long::Configure ("bundling");
+
+$|=1;
+
+sub usage {
+    warn "usage: " . basename($0) . " [ -v ] [hostgroup | hostnames...]\n";
+    exit 0;
+}
+
+GetOptions(
+    "line-count|linecount|l=i" => \$lines_per_page,
+    "verbose|v" => \$verbose,
+    "quiet|q"   => \$quiet,
+    "columns|C" => \$columns,
+    "utf8|u"    => \$utf8,
+    "color|c"   => \$color,
+    "curl=s"    => \$curl,
+    "host=s"    => \$host_header,
+    "vipselect=i" => \$vipselect,
+);
+
+binmode(STDOUT);
+if ($utf8) {
+  $checkmark=" ${utf8_checkmark}";
+  $cross=" ${utf8_cross}";
+  $dash=" ${utf8_dash}";
+  binmode(STDOUT, ":utf8");
+}
+
+if ($color) {
+  $bold="\e[1;31m";
+  $normal="\e[1;32m";
+}
+
+if ($host_header) {
+  @host_header=("-H", "Host: ${host_header}");
+}
+
+$ENV{PATH}="/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:/home/y/bin:/home/y/sbin";
+
+for my $path (split(/:/, $ENV{PATH})) {
+  if (-x "${path}/curl") {
+    $curl="${path}/curl";
+    last;
+  }
+}
+
+sub map_hostname_for_sorting {
+    my($host) = @_;
+    my @domain_components = split(/\./, $host);
+    my $reversed_name = join('.', reverse @domain_components);
+    $reversed_name="com.yahoo.${reversed_name}" unless ($reversed_name =~ /^(com|org|net|[a-z]{2})\./);
+    $reversed_name =~ s/(\d+)/sprintf "%09d", $1/eg;
+    return $reversed_name;
+}
+
+{ my %hostname_sort_mapping;
+sub by_hostname {
+    $hostname_sort_mapping{$a} ||= map_hostname_for_sorting($a);
+    $hostname_sort_mapping{$b} ||= map_hostname_for_sorting($b);
+    return $hostname_sort_mapping{$a} cmp $hostname_sort_mapping{$b};
+}}
+
+sub get_hostnames {
+    my @hosts;
+
+    if ($0 =~ /(?:^|.*\/)(\w+)_hosts/) {
+        my $hostgroup=$1;
+        my $groupfile="$ENV{HOME}/.hostgroups/${hostgroup}";
+        if (open(F, "<", $groupfile)) {
+            while(<F>) {
+                chomp;
+                next if (/^\s*(?:#.*)$/);
+                push @hosts, $_;
+            }
+        }
+        else {
+            die "${groupfile}: cannot open\n";
+        }
+    }
+    else {
+        my @args=@ARGV;
+        while(my $host = shift @args) {
+            print STDERR "+ ${host}\n";
+            if ($host eq '-') {
+                while(<STDIN>) {
+                    next if (/^\s*(#.*)$/);
+                    chomp;
+                    s/\[([^\]]+)\]/$1/g;
+                    if (/\d-\d|\@|,/) {
+                      push @hosts, $igor->expand_range($_);
+                    }
+                    else {
+                      push @hosts, $_;
+                    }
+                }
+            }
+            elsif (open(HOSTLIST, "<", $host)) {
+              print STDERR "< ${host}\n";
+              while(<HOSTLIST>) {
+                next if (/^\s*(#.*)$/);
+                chomp;
+                # I like to use yinst-style numeric ranges, so let's convert them to igor-style...
+                s/\[([^\]]+)\]/$1/g;
+                if (/\d-\d|\@|,/) {
+                  push @hosts, $igor->expand_range($_);
+                }
+                else {
+                  push @hosts, $_;
+                }
+              }
+              close(HOSTLIST);
+            }
+            else {
+              # I like to use yinst-style numeric ranges, so let's convert them to igor-style...
+              $host =~ s/\[([^\]]+)\]/$1/g;
+              if ($host =~ /\d-\d|\@|,/) {
+                push @hosts, $igor->expand_range($host);
+              }
+              else {
+                push @hosts, $host;
+              }
+            }
+        }
+    }
+    
+    my $resolver=Net::DNS::Resolver->new;
+    my @qualified_hosts;
+
+    foreach my $host (@hosts) {
+        my $query;
+        $host =~ s/\.*$//;
+        $query = $resolver->search("${host}.");
+        if (! $query) {
+            if ($query = $resolver->search("${host}.yahoo.com.")) {
+                $host="${host}.yahoo.com";
+            }
+            else {
+                if ($query = $resolver->search("${host}.corp.yahoo.com.")) {
+                    $host="${host}.corp.yahoo.com";
+                }
+                else {
+                    warn "${host}: cannot resolve\n" unless ($quiet);
+                    next;
+                }
+            }
+        }
+        push @qualified_hosts, $host;
+    }
+    my %hosts_by_colo;
+    foreach my $host (@qualified_hosts) {
+        if ($host =~ /(.*?)\.((?:corp\.)?[^\.]+)\.yahoo\.com$/) {
+            $hosts_by_colo{$2}{$host} = $1;
+        }
+    }
+    return %hosts_by_colo;
+}
+
+%hosts_by_colo = get_hostnames;
+
+sub check_ping {
+  my $host=shift;
+  if (ping(hostname => $host, timeout => 1, count => 1)) {
+    return 0;
+  }
+  elsif (ping(hostname => $host, timeout => 3, count => 2)) {
+    return 0;
+  }
+  else {
+    return 1;
+  }
+}
+
+sub check_url {
+  my ($url, @curl_opts) = @_;
+  #my $result=getstore($url, "/dev/null");
+  #if (is_success($result)) {
+    #return 1;
+  #}
+  #else {
+    #return 0;
+  #}
+  my $result=system($curl, @curl_opts, "-f", "-o", "/dev/null", "-m", "3", "-s", $url);
+  $result = $result >> 8 if ($result != 0);
+  if ($result == 0) {
+    return 0;
+  }
+  elsif ($result > 21) {
+    return 1;
+  }
+  else {
+    return 2;
+  }
+}
+
+sub check_akamai {
+  my ($host, $port) = @_;
+  if (defined($port) and $port != 80) {
+    warn "$0: check_akamai: akamai/brooklyn health checks can only be on port 80.\n";
+  }
+  else {
+    my @hdr=@host_header;
+    if ($host =~ /^(ycpi|yts)\d+\./) {
+      push @hdr, "-H", "Host: hc.l.yimg.com";
+    }
+    return check_url("http://${host}:80/akamai", @hdr);
+  }
+}
+
+sub check_status {
+  my ($host, $port, $vipselect) = @_;
+  my @hdr=@host_header;
+  $vipselect="" unless (defined($vipselect) and $vipselect =~ /^[0-9]+$/);
+  push @hdr, "-H", "Host: hc.l.yimg.com" if ($host =~ /^(yts|ycpi)\d+\./);
+  return check_url("http://${host}:${port}/status${vipselect}.html", @hdr);
+}
+
+sub choose_from {
+  my $idx=shift;
+  if (defined($idx)) {
+    return $_[$idx+1];
+  }
+  else {
+    return $_[0];
+  }
+}
+
+sub print_host {
+  my ($host, $format, $ping, $akamai, $status_80, $status_4080) = @_;
+  my $ping_color = choose_from($ping, $bold, $normal, $bold);
+  my $ping_string = choose_from($ping, "...", $checkmark, $cross);
+  my $akamai_color = choose_from($akamai, $reset_color, $normal, $normal, $bold);
+  my $akamai_string = choose_from($akamai, "...", $checkmark, $dash, $cross);
+  my $status_80_color = choose_from($status_80, $reset_color, $normal, $normal, $bold);
+  my $status_80_string = choose_from($status_80, "...", $checkmark, $dash, $cross);
+  my $status_4080_color = choose_from($status_4080, $reset_color, $normal, $normal, $bold);
+  my $status_4080_string = choose_from($status_4080, "...", $checkmark, $dash, $cross);
+  printf $format, $host, $ping_color, $ping_string, $reset_color,
+                         $akamai_color, $akamai_string, $reset_color,
+                         $status_80_color, $status_80_string, $reset_color,
+                         $status_4080_color, $status_4080_string, $reset_color;
+}
+
+open(STDERR, ">", "/dev/null");
+
+if ($columns) {
+  my $max_hostname_length=0;
+  # get all the unique hostnames _without_ colos...
+  foreach my $colo (keys %hosts_by_colo) {
+    foreach my $host (keys %{$hosts_by_colo{$colo}}) {
+      $host =~ s/\.${colo}\.yahoo.com$//;
+      $short_hostnames{$host} = 1;
+      $max_hostname_length = length($host) if (length($host) > $max_hostname_length);
+    }
+  }
+
+  printf "%${max_hostname_length}s ", "";
+  foreach my $colo (sort keys %hosts_by_colo) {
+    printf "%-3.3s ", $colo;
+  }
+  print "\n";
+  foreach my $short_hostname (sort by_hostname (keys %short_hostnames)) {
+    printf "\r%${max_hostname_length}.${max_hostname_length}s ", $short_hostname;
+    foreach my $colo (sort keys %hosts_by_colo) {
+      my $hostname="${short_hostname}.${colo}.yahoo.com";
+      if (! exists $hosts_by_colo{$colo}{$hostname}) {
+        print "    ";
+      }
+      elsif (0 == check_ping($hostname)) {
+        print ".";
+        print(("A", "-", "X")[check_akamai($hostname)]);
+#        if (check_akamai($hostname)) {
+#          print ".";
+#        }
+#        else {
+#          print "A";
+#        }
+        print(("8", "-", "X")[check_akamai($hostname)]);
+#        if (check_status($hostname, 80, $vipselect)) {
+#          print ".";
+#        }
+#        else {
+#          print "8";
+#        }
+        print(("4", "-", "X")[check_akamai($hostname)]);
+#        if (check_status($hostname, 4080)) {
+#          print ". ";
+#        }
+#        else {
+#          print "4 ";
+#        }
+      }
+      else {
+        print "P   ";
+      }
+    }
+    $line_count = ($line_count + 1) % $lines_per_page;
+    print "\n";
+  }
+}
+else {
+  my $max_hostname_length=0;
+  # get all the unique hostnames _with_ colos...
+  foreach my $colo (keys %hosts_by_colo) {
+    foreach my $host (keys %{$hosts_by_colo{$colo}}) {
+      $max_hostname_length = length($host) if (length($host) > $max_hostname_length);
+    }
+  }
+
+  printf "\n  %-${max_hostname_length}s %4s %6s %-6s %-6s\n", "Hostname", "Ping", "Akamai", "  80", "4080";
+  foreach my $colo (sort keys %hosts_by_colo) {
+    print "${colo}:\n";
+    foreach my $host (sort by_hostname keys %{$hosts_by_colo{$colo}}) {
+      my $ping;
+      my $akamai;
+      my $status={80 => undef, 4080 => undef};
+      my $short_hostname=$hosts_by_colo{$colo}{$host};
+      my $format="\r  %-${max_hostname_length}.${max_hostname_length}s %s%-4s%s %s%-6s%s %s%-6s%s %s%-6s%s";
+      print_host($host, $format, $ping, $akamai, $status->{80}, $status->{4080});
+      $ping = check_ping($host);
+      print_host($host, $format, $ping, $akamai, $status->{80}, $status->{4080});
+      if (0 == $ping) {
+        $status->{80} = check_status($host, 80, $vipselect);
+        print_host($host, $format, $ping, $akamai, $status->{80}, $status->{4080});
+        $status->{4080} = check_status($host, 4080);
+        print_host($host, $format, $ping, $akamai, $status->{80}, $status->{4080});
+        $akamai = check_akamai($host);
+        print_host($host, $format, $ping, $akamai, $status->{80}, $status->{4080});
+      }
+      $line_count = ($line_count + 1) % $lines_per_page;
+      print "\n";
+    }
+  }
+}

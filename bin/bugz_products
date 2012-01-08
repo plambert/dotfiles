@@ -1,0 +1,28 @@
+#!/bin/bash
+
+products_page="http://bug.corp.yahoo.com/query.cgi?classification=All&ps=*&format=advanced&showall=1"
+query_url="http://bug.corp.yahoo.com/query.cgi?classification=All&search=Search&format=advanced&p=%s"
+html_dir="/home/y/share/htdocs/plambert"
+html_page="${html_dir}/bugzilla_product_search.html"
+product_list_file="${html_dir}/bugzilla_product_list.txt"
+
+tmpfile="$(mktemp -t bugz_products.XXXXXX)"
+
+url_for_product() {
+  printf "${query_url}" "$1"
+}
+
+bycurl -f -s "${products_page}" \
+| perl -ne 'print "$1\n" if (/^\s*value="([^"]+)"\s*$/)' \
+| while read product; do
+    printf "<li><a href=\"%s\">%s</a></li>\n" "$(url_for_product "${product}")" "${product}"
+  done > "${tmpfile}"
+
+(
+  echo "<html><head><title>Bugzilla Product Search</title></head><body><ul>"
+  cat "${tmpfile}"
+  echo "</ul></body></html>"
+) > "${html_page}"
+
+rm -f "${tmpfile}"
+

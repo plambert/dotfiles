@@ -1,0 +1,140 @@
+#!/bin/bash
+
+# given a package, show if it's installed locally, all the branches on dist, _and_ the last N (default 10) versions...
+
+max_recent_entries=0
+
+usage() {
+  local rc=0
+  if [[ -n "$1" ]]; then
+    echo "$0: $@" 1>&2
+    rc=1
+  fi
+  echo \
+"Show information about a yinst package
+
+usage: $0 [options] <package>
+
+options:
+  -h       This help
+  -#       How many recent versions to show (default 0)
+  -a       Show all versions
+  -u       Show a dist URL
+
+"
+  exit $rc
+}
+
+yinfo_for() {
+  local package="$1"; shift
+  local max_recent="$1"; shift
+  local installed_version="$(yinst ls "${package}" 2> /dev/null)"
+  local -a recent
+  local -a branches
+  local installed=""
+  local comment comment_filter output_filter
+  local available_package="" install_user="" install_timestamp="" output_filter="" p=""
+  local tmpfile="$(mktemp -t yinst_ls.XXXXXX)"
+  trap 'rm -f "${tmpfile}"' EXIT 
+
+  yinst package -all "${package}" > "${tmpfile}"
+
+  if [[ -s "${tmpfile}" ]]; then
+    while read available_package ; do
+      #echo "=== ${available_package}"
+      if [[ -n "${installed_version}" && -z "${installed}" ]]; then
+        if [[ "${available_package}" == "${installed_version}" ]]; then
+          installed="${available_package} (installed)"
+          #echo "installed=\"${installed}\""
+        elif [[ "${available_package}" == "${installed_version} "* ]]; then
+          installed="${available_package%)} installed)"
+          #echo "installed=\"${installed}\""
+        fi
+      elif [[ "${available_package}" == *" "* ]]; then
+        branches=( "${branches[@]}" "${available_package}" )
+        #echo "branches=${branches[@]}"
+      elif [[ $max_recent -gt 0 ]]; then
+        recent=( "${recent[@]}" "${available_package}" )
+        if [[ ${#recent[@]} -gt $max_recent ]]; then
+          recent=( "${recent[@]:1}" )
+        fi
+        #echo "recent=${recent[@]}"
+      fi
+    done < "${tmpfile}"
+
+    if [[ -n "${installed}" && -f "${ROOT}/var/yinst/log/yinstlog" ]]; then
+      grep package="${installed_version} " "${ROOT}/var/yinst/log/yinstlog" | grep " action=activate " | tail -1 > "${tmpfile}" 2>/dev/null
+      if [[ -s "${tmpfile}" ]]; then
+        install_user="$(sed -e 's/^.*user=//' -e 's/ .*//' "${tmpfile}")"
+        install_timestamp="$(sed -e 's/.*start_time=//' -e 's/ .*//' "${tmpfile}")"
+        install_timestamp="$(perl -e 'print scalar(localtime(shift))' "${install_timestamp}")"
+        installed="${installed} (${install_timestamp} by ${install_user})"
+      fi
+    fi
+
+    comment_filter=( sed -e $'s/^[^ ]* \\+//' -e $'s/ (\(stable\|test\|current\))$//' )
+    output_filter=( sed -e $'s/\(.*\)\( (.*installed)\)/\e[1m\\1\e[0m\\2/' )
+    if [[ $max_recent -gt 0 ]]; then
+      output_filter=( "${output_filter[@]}" -e $'s/(.*)/\e[1m&\e[0m/' )
+    fi
+
+    if [[ -n "${installed_version}" ]]; then
+      comment="$(yinst ls -comment "${installed_version}" | "${comment_filter[@]}")"
+    else
+      comment="$(yinst package -comment "${package}" | "${comment_filter[@]}")"
+    fi
+
+    if ! tty >/dev/null 2>&1; then
+      output_filter=( sed -e $'s/^/  /' )
+      printf "=== %s ===\n" "${comment}"
+    else
+      width="$(stty -a | grep columns | sed -e 's/.*\([0-9 ]\+\)columns\([0-9 ]\+\).*/\1\2/')"
+      width=$(( $width - 2 ))
+      printf "\n\e[47m%-${width}s\e[0m\n" "${comment}"
+      output_filter=( "${output_filter[@]}" -e $'s/^/\e[47m  \e[0m /' )
+    fi
+
+    for p in ${installed:+"${installed}"} "${branches[@]}" "${recent[@]}"; do
+      echo "${p}"
+    done | natural_sort -u | "${output_filter[@]}"
+    rm -f "${tmpfile}"
+    trap - EXIT
+  else
+    echo "${package}: no such package"
+  fi
+}
+
+natural_sort() {
+  perl -ne 'chomp; $x=$_; s/(\d+)/sprintf "%09d", $1/eg; print "$_\000$x\n";' | sort "$@" | awk -F"\000" '{print $2}'
+}
+
+url_for() {
+  local p="$1"; shift
+  echo "http://dist.corp.yahoo.com/by-package/${p}/"
+}
+
+packages=( )
+urls_shown=
+
+while [[ -n "$1" ]]; do
+  opt="$1"; shift
+  case "${opt}" in
+    -u ) urls_shown=-yes-; url_for "$1"; shift ;;
+    -[0-9]* ) max_recent_entries="${package#-}" ;;
+    -* ) usage "${opt}: unknown option" ;;
+    * ) packages=( "${packages[@]}" "${opt}" ) ;;
+  esac
+done
+
+if [[ "${#packages[@]}" -gt 0 ]]; then
+  for package in "${packages[@]}"; do
+    yinfo_for "${package}" "${max_recent_entries}"
+  done
+elif [[ -z "${urls_shown}" ]]; then
+  for package in $(yinst ls -noversion); do
+    if [[ "${package}" != */* ]]; then
+      yinfo_for "${package}" "${max_recent_entries}"
+    fi
+  done
+fi
+

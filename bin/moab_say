@@ -1,0 +1,477 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Time::Local;
+
+my $prowl;
+my $idle;
+
+if ($^O ne 'darwin') {
+  die "$0: can only run under Mac OS X, sorry!\n";
+}
+
+eval {
+  require WebService::Prowl;
+};
+if ( ! $@ ) {
+  WebService::Prowl->import;
+  my $apikey;
+  if (open(APIKEY, "<", $ENV{HOME} . "/.prowl_api_key")) {
+    chomp($apikey=<APIKEY>);
+    close(APIKEY);
+    $prowl=WebService::Prowl->new(apikey => $apikey);
+    if (! $prowl->verify) {
+      warn "Prowl API key couldn't be verified, not using Prowl!\n";
+      undef $prowl;
+    }
+  }
+  else {
+    die "No Prowl API key in ~/.prowl_api_key\n";
+  }
+}
+
+sub install_growl {
+  # installs growlnotify and growl
+  my $dmg='http://growl.cachefly.net/Growl-1.2.dmg';
+  my $cwd=`pwd`;
+  chomp($cwd);
+  system "hdiutil", "mount", $dmg;
+  system "wait4path", "/Volumes/Growl-1.2/Extras/growlnotify";
+  chdir "/Volumes/Growl-1.2/Extras/growlnotify";
+  system "sudo", "./install.sh";
+  chdir $cwd;
+  system "sudo", "installer", "-verbose", "-pkg", "/Volumes/Growl-1.2/Growl.pkg", "-target", "/";
+  while( my $rc=system "hdiutil", "detach", "/Volumes/Growl-1.2" ) {
+    sleep 1;
+  }
+  exit;
+}
+
+$|=1;
+
+my $year;
+my $month;
+my %spoken;
+my $colo_regexp=qr{\b(?:mud|aue|(?:sp|re|ac)\d)\b};
+my $host_substitutions={
+  'aue' => 'a u e',
+  're4' => 'r e 4',
+  're3' => 'r e 3',
+  'ac4' => 'a c 4',
+  'sp1' => 's p 1',
+  'sp2' => 's p 2',
+  'mud' => 'mud',
+  'fe' => 'f e',
+  'db' => 'd b',
+  'qfroot' => 'q f root',
+  'qfalerts' => 'q f alerts',
+  'api' => 'A P I',
+  'streamerapi' => 'streamer A P I',
+  'scache' => 's cache',
+  'acache' => 'a cache',
+  'cms' => 'c m s',
+  'xslt' => 'x s l t',
+  'xsltm' => 'x s l t m',
+  'omg' => 'o m g',
+  'iapi' => 'i a p i',
+};
+my $last_check=time - 600; # ten minutes ago
+my $last_spoke=0;
+my $date=`date +%Y-%m-%d`;
+chomp($date);
+my $growlnotify;
+my $verbose;
+my $silent;
+my $daemon;
+my $word_substitutions={
+  qr{streamerapi}i => 'Streamer A P I',
+  qr{/home/y/logs/yapache(/us)?/([^/]+)} => sub { "why apache $1 log" },
+  qr{(/home/y/\S+/[^/]+)} => sub {speech_for_path($1)},
+  qr{\[(warn|crit)\]} => sub {lc($1)},
+  qr{crit} => "critical!",
+  qr{warn} => "warning!",
+  qr{=+W(\d+\.\d+)} => " is over warning level",
+  qr{=+C(\d+\.\d+)} => " is over critical level",
+  qr{(\w+)_(\w+)} => sub {"$1 underscore $2"},
+  qr{omg} => 'o m g',
+  qr{yapache} => "why apache",
+  qr{VIP} => "vipp",
+  qr{HTTP/1.(\d)} => sub {"HTTP one $1"},
+  qr{([a-z][a-z0-9_-]+\.[a-z][a-z0-9_-]+)=([CW])\[(.+?)\]} => sub {"$1 is at " . ($2 eq 'W' ? 'warning' : 'critical') . " level $3"},
+  qr{ysar} => "why sar",
+  qr{ysquid} => "why squid",
+  qr{mysql} => "my sequel",
+  qr{(\s)/(akamai|status(?:\.html)?)(?=,?\s)} => sub {"$1 slash $2"},
+  qr{(\d+)\s+secs} => sub {"$1 seconds"},
+  qr{(\S+)=(\S+)} => sub {"$1 equals $2"},
+  qr{([a-z][a-z0-9]*(?:\[[\d\-,]+\])?(?:\.[a-z][a-z0-9]+){2,})} => sub {speech_for_hostname($1)},
+  qr{((?:DNSERR, ){3,})} => sub { sprintf("DNSERR %d times", length($1) / 8) },
+};
+my $failure_count=0;
+my $delay=60;
+my $current_delay;
+my $max_idle_time=600;
+
+for my $path ('/usr/bin', '/usr/local/bin', '/opt/local/bin', split(/:/, $ENV{PATH})) {
+  if (-x "${path}/growlnotify") {
+    $growlnotify="${path}/growlnotify";
+    last;
+  }
+}
+
+if ($date and $date =~ /^(\d{4})-(\d\d)/) {
+  ($year, $month) = ($1, $2);
+}
+else {
+  die "can't get date"
+}
+
+while(defined($ARGV[0]) and $ARGV[0] =~ /^-/) {
+  my $opt=shift;
+  if ($opt eq '-v' or $opt eq '--verbose') {
+    $verbose=1;
+  }
+  elsif ($opt eq '-s' or $opt eq '--silent') {
+    $silent=1;
+  }
+  elsif ($opt eq '-d' or $opt eq '--daemon') {
+    $daemon=1;
+  }
+  elsif ($opt =~ /^--install[-_]growl$/) {
+    exit(install_growl);
+  }
+  elsif ($opt eq '-i' or $opt eq '--idle') {
+    $max_idle_time=shift;
+    die "idle time must be numeric\n" unless ($max_idle_time =~ /^(\d+\.\d*|\d*\.\d+)$/);
+  }
+  else {
+    die "unknown option '${opt}'\n";
+  }
+}
+
+my $url="http://irc1.ops.corp.sk1.yahoo.com/log/mediaops-triage/${year}/${month}/${date}.txt";
+my $html_template=join('', <DATA>);
+
+$SIG{INT}=sub { exit; };
+
+# find the console idle time--taken from this bash snippet:
+# echo $(ioreg -c IOHIDSystem | grep HIDIdleTime | sed -e 's/.* = //g' | sort -n | head -1) / 1000000000 | bc -l
+sub idletime {
+  my $idle_limit=shift;
+  my $idle=0;
+  if (-x "/usr/sbin/ioreg" and open(IOREG, "-|", "/usr/sbin/ioreg", "-c", "IOHIDSystem")) {
+    while(defined(my $line=<IOREG>)) {
+      if ($line =~ /"HIDIdleTime"\s*=\s*(\d+)\s*$/) {
+        if ($idle == 0 or $idle > $1) {
+          $idle = $1;
+        }
+      }
+    }
+    close(IOREG);
+  }
+  $idle = 1.0 * $idle / 1000000000.0;
+  if (defined($idle_limit)) {
+    if ($idle_limit =~ /^(\d*\.?\d+|\d+\.\d*|\d+)([smhd])?$/) {
+      my ($idle_limit, $unit) = ($1, $2 || 's');
+      my %seconds_per_unit = (
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+      );
+      $idle_limit *= $seconds_per_unit{$unit};
+    }
+    else {
+      die "cannot parse idle_limit '${idle_limit}'";
+    }
+  }
+  else {
+    $idle_limit = 0;
+  }
+  if ($idle >= $idle_limit) {
+    return $idle;
+  }
+  else {
+    return;
+  }
+}
+
+sub growl {
+  my $message=shift;
+  system $growlnotify, '-s', '-m', $message, '-n', 'MOAB', 'MOAB' if ($growlnotify);
+}
+
+sub notify {
+  my $message=shift;
+  print "MOAB: ${message}\n" unless ($daemon);
+  if ($prowl and $idle > $max_idle_time) {
+    $prowl->add(
+        application => 'MOAB',
+        event => 'MOAB Notice',
+        description => "${idle} seconds: $message",
+    );
+  }
+  if ($silent) {
+    #system $growlnotify, '-s', '-m', $message, '-n', 'MOAB', 'MOAB' if ($growlnotify);
+    growl($message);
+  }
+  else {
+    my $speech=speech_for_message($message);
+    print "  saying '${speech}'\n" if ($verbose);
+    growl_and_say($message, $speech);
+  }
+}
+
+# run a bash script to say something, show a sticky notification, and stop talking if the notification is clicked.
+sub growl_and_say {
+  my ($message, $speech) = @_;
+  if (open(BASH, "|-", "/bin/bash", "-s", $message, $speech)) {
+    print BASH <<'END_OF_SCRIPT';
+#!/bin/bash
+say "$2" &
+say_pid=$!
+growlnotify -w -s -m "$1" -n MOAB MOAB
+kill ${say_pid} >/dev/null 2>&1
+END_OF_SCRIPT
+    close(BASH);
+  }
+}
+
+sub say {
+  if (defined($_[0])) {
+    $last_spoke=time;
+    system "say", @_;
+    return;
+  }
+  else {
+    # speak up if we haven't spoken in a while...
+    my $silence_time=time-$last_spoke;
+    return unless ($silence_time > 600);
+    system "say", sprintf("All clear for the last %d minutes!", (0.5+$silence_time/60.0));
+    return;
+  }
+}
+
+sub get_log {
+  my $page=`curl --connect-timeout 15 -f -s -v "${url}" 2> /tmp/.moab_curl_err`;
+  if ($? == 0) {
+    my $html=$html_template;
+    my @irc_lines;
+    while($page =~ m{^(<tr\s*>.*)$}gm) {
+      my $row=$1;
+      $row =~ s{<font color=white size=-10>}{}g;
+      $row =~ s{</font>}{}g;
+      unshift @irc_lines, "${row}\n";
+      pop @irc_lines if (@irc_lines > 20);
+    }
+    $html =~ s/<!-- CONTENT -->/@irc_lines/;
+    if(open(HTML, ">/Library/WebServer/Documents/moab.html")) {
+      print HTML $html;
+      close(HTML);
+    }
+    return $page;
+  }
+  else {
+    warn "${url}: returned " . ($? << 8) . ":\n";
+    system "cat /tmp/.moab_curl_err 1>&2 && rm -f /tmp/.moab_curl_err";
+    return;
+  }
+}
+
+sub scan_log {
+  my ($url, $since)=@_;
+  my @msgs;
+  my %last_seen_time;
+  my $log=get_log();
+  my $now=time;
+  $since ||= $now - 3600;
+  my ($day, $month, $year) = (localtime)[3,4,5];
+  if (!defined($log)) {
+    return undef;
+  }
+  # From: Change Management System -- Subject: [CMR 210305] [APPROVED] Changing health check URL for
+  while($log =~ m{name="(\d\d):(\d\d):(\d\d)".*?&lt;moab&gt; (From: .*? -- Subject: .*?|\S+\@\S+: \*?(?:\S{0,2}\s+)?.*)</td></tr>$}igm) {
+    my ($hour, $min, $sec, $msg)=($1, $2, $3, $4);
+    my $stamp=timelocal($sec, $min, $hour, $day, $month, $year);
+    if ($stamp > $now) {
+      # must be yesterday
+      $stamp = $stamp - 86400;   # number of seconds in a day
+    }
+    unless ($last_seen_time{$msg}) {
+      $msg="${hour}:${min}:${sec} ${msg}";
+      push @msgs, $msg;
+      $last_seen_time{$msg}=$stamp;
+    }
+  }
+  @msgs=grep { $last_seen_time{$_} >= $since and ! exists $spoken{$_} } (@msgs);
+  foreach my $msg (@msgs) {
+    $spoken{$msg}=1;
+  }
+  return @msgs;
+}
+
+sub speech_for_message {
+  my $speech=shift;
+  if ($speech =~ m{^(\d\d:\d\d):\d\d From: (.*?) -- Subject: (.*)}) {
+    $speech = "email at $1 from $2 regarding $3";
+  }
+  else {
+    $speech =~ s{^(\d\d:\d\d):\d\d (\w+?)\@\S+ \*S (.+?) / (.+) / ([^/]+)}{$2 alert at $1, service $3 on $5 : $4};
+    $speech =~ s{^(\d\d:\d\d):\d\d (\w+?)\@\S+ \*(\S+) / (.+?) / (.*)}{$2 alert at $1, service $4 on $3 : $5};
+    $speech =~ s{^(\d\d:\d\d):\d\d (\w+?)\@\S+}{$2 alert at $1,};
+  }
+  while (my ($regexp, $substitute)=each %$word_substitutions) {
+    if (ref $substitute eq 'CODE') {
+      $speech =~ s{\b${regexp}\b}{&$substitute}ieg;
+    }
+    else {
+      $speech =~ s{\b${regexp}\b}{$substitute}ig;
+    }
+  }
+  return $speech;
+}
+
+sub speech_for_path {
+  my $path=shift;
+  $path =~ s{/+}{ slash }g;
+  return $path;
+}
+
+sub speech_for_hostname {
+  my $host=shift;
+  print "${host} " if ($verbose);
+  $host =~ s{\.yahoo\.com$}{};
+  my @parts=split(/\./, $host);
+  for my $part (@parts) {
+    while(my ($hostpart, $substitute)=each(%$host_substitutions)) {
+      if ($part =~ s{^${hostpart}(?=[0-9\.-_\[\]])}{${substitute} }i) {
+        print "${hostpart} " if ($verbose);
+      }
+    }
+    $part =~ s{\[([\d,-]+)\]$}{speech_for_range($1)}e;
+    $part =~ s{^ +}{};
+    $part =~ s{ +$}{};
+  }
+  $host = join(' dot ', @parts);
+  $host =~ s{\s\s+}{ }g;
+  print " => ${host}\n" if ($verbose);
+  return $host;
+}
+
+sub speech_for_range {
+  my $range=shift;
+  my @ranges=split(',', $range);
+  my $speech;
+  for (@ranges) {
+    if (m{^(\d+)-(\d+)$}) {
+      my ($start, $end) = ($1, $2);
+      if ($start == $end) {
+        $_=$start;
+      }
+      elsif ($start + 1 == $end) {
+        $_="${start}, ${end}";
+      }
+      else {
+        $_="${start} through ${end}";
+      }
+    }
+  }
+  $speech=join(', ', @ranges);
+  $speech =~ s{, ([^,]*)$}{, and $1};
+  return " ${speech} ";
+}
+
+while($failure_count < 3) {
+  my @new_speech;
+  my @new_messages=scan_log($url, $last_check);
+  if (defined($new_messages[0])) {
+    $failure_count=0;
+    $last_check=time;
+    $idle = idletime;
+    for my $message (@new_messages) {
+      notify($message);
+    }
+  }
+  elsif (0 == @new_messages) {
+    print scalar(localtime), ": all clear\n";
+    notify();
+  }
+  else {
+    $failure_count++;
+    say("Unable to get moe abb log");
+    #system $growlnotify, '-m', 'Unable to get MOAB log', '-n', 'MOAB', 'MOAB' if ($growlnotify);
+    notify("Unable to get MOAB log");
+    $current_delay = 5;
+  }
+  if (!defined($current_delay)) {
+    $current_delay = ($delay / 5) + rand(4*$delay/5);
+  }
+  sleep $current_delay;
+  if ($current_delay != $delay) {
+    $current_delay=$delay;
+  }
+}
+
+say("Moe abb say is exiting!") unless $silent;
+#system $growlnotify, '-s', '-m', "Gave up after ${failure_count} tries: exiting at " . scalar(localtime), '-n', 'MOAB', 'MOAB' if ($growlnotify);
+notify(sprintf("Gave up after %d tries.  Exiting at %s.", $failure_count, scalar(localtime)));
+exit;
+
+__DATA__
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
+  "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+  <head>
+    <title>MOAB</title>
+
+    <!-- Meta Tags -->
+
+    <meta http-equiv="content-type" content="application/xhtml+xml; charset=utf-8" />
+    <meta name="robots" content="index, follow" />
+    <meta http-equiv="refresh" content="15" />
+    <meta name = "viewport" content = "width=device-width">
+    <meta name="format-detection" content="telephone=no" >
+    <!-- <meta name="description" content="" /> -->
+    <!-- <meta name="keywords" content="" /> -->
+    <!-- <meta name="author" content="" /> -->
+
+    <!-- Favicon -->
+    <!-- <link rel="shortcut icon" href="" /> -->
+
+    <!-- CSS -->
+    <!-- <link rel="stylesheet" href="" media="screen,projection" type="text/css" /> -->
+    <!-- <link rel="stylesheet" href="" media="print" type="text/css" /> -->
+    <style type="text/css">
+      <!--
+
+      /* ----- CSS ----- */
+
+      -->
+    </style>
+
+    <!-- RSS -->
+
+    <!-- <link rel="alternate" href="" title="RSS Feed" type="application/rss+xml" /> -->
+
+    <!-- JavaScript -->
+    <!-- <script src="" type="text/javascript"></script> -->
+    <script type="text/javascript">
+      <!--
+
+      // JavaScript
+      // window.onload = function(){}
+
+      //-->
+    </script>
+
+  </head>
+
+  <body>
+    <table>
+      <!-- CONTENT -->
+    </table>
+  </body>
+</html>
